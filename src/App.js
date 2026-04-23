@@ -18,12 +18,6 @@ function makeTheme(dark) {
 /* ── GOOGLE PLACES ───────────────────────────────────────── */
 const PLACES_KEY = "AIzaSyCkg3ThAKCWzEu-waM_KBsX4Ys90MJNSAo";
 
-// Build best Eventbrite URL — use direct event URL if available
-function eventbriteUrl(spot) {
-  if (spot.ebUrl) return spot.ebUrl;
-  return `https://www.eventbrite.com/d/nearby--${encodeURIComponent((spot.address||"").split(",")[0])}/events/`;
-}
-const EB_KEY = "YHEUZ2CRGTHLLVC5QF7B";
 const CAT_QUERY = {
   restaurants:"restaurants", nightlife:"bars nightlife",
   experiences:"activities things to do outdoors parks", outdoors:"parks outdoor", dessert:"dessert cafe",
@@ -40,19 +34,31 @@ function noiseFromTypes(types=[]) {
 function priceFromLevel(l){ return["$","$","$$","$$$","$$$$"][Math.min(l??1,4)]; }
 function transformGPlace(p,cat){
   const photoRef=p.photos?.[0]?.photo_reference;
+  // Store all photo refs for gallery (up to 8)
+  const allPhotoRefs = (p.photos||[]).slice(0,8).map(ph=>ph.photo_reference).filter(Boolean);
   const DG={restaurants:"linear-gradient(160deg,#3A0808,#600E10)",nightlife:"linear-gradient(160deg,#180A35,#28145A)",experiences:"linear-gradient(160deg,#2A1A08,#402810)",outdoors:"linear-gradient(160deg,#0A2A14,#124020)",dessert:"linear-gradient(160deg,#3A0A18,#5A1028)"};
   const LG={restaurants:"linear-gradient(160deg,#FFF0F0,#FFDEDE)",nightlife:"linear-gradient(160deg,#F4F0FF,#EAE2FF)",experiences:"linear-gradient(160deg,#FFF4EE,#FFE4D4)",outdoors:"linear-gradient(160deg,#EEFFF4,#DCFFE8)",dessert:"linear-gradient(160deg,#FFF0F6,#FFDDED)"};
   const EM={restaurants:"🍽️",nightlife:"🌙",experiences:"✨",outdoors:"🌿",dessert:"🍰"};
+  const address = p.formatted_address||p.vicinity||"";
+  const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(p.name)}&query_place_id=${p.place_id}`;
+  // Build busy times from popular_times if available
+  const popularTimes = p.current_popularity || null;
+  // Weekday hours text
+  const hoursText = p.opening_hours?.weekday_text || null;
+  const isOpen = p.opening_hours?.open_now;
   return {
     id:p.place_id, name:p.name, cat,
-    tag:p.types?.[0]?.replace(/_/g," ").replace(/\b\w/g,c=>c.toUpperCase())||cat,
-    address:p.formatted_address||p.vicinity||"",
+    tag:p.types?.[0]?.replace(/_/g," ").replace(/\w/g,c=>c.toUpperCase())||cat,
+    address, mapsUrl,
     rating:p.rating||4.5, reviews:p.user_ratings_total||0,
     price:priceFromLevel(p.price_level), noise:noiseFromTypes(p.types||[]),
-    isOpen:p.opening_hours?.open_now,
+    isOpen, hoursText, popularTimes,
     photoUrl:photoRef?`https://maps.googleapis.com/maps/api/place/photo?maxwidth=400&photoreference=${photoRef}&key=${PLACES_KEY}`:null,
+    photos:allPhotoRefs.map(ref=>`https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photoreference=${ref}&key=${PLACES_KEY}`),
     emoji:EM[cat]||"📍", dg:DG[cat]||DG.restaurants, lg:LG[cat]||LG.restaurants,
-    desc:`${p.name} · ${p.formatted_address?.split(",")[1]?.trim()||""}`,
+    // desc will be enriched by fetchPlaceDetails, default to editorial summary placeholder
+    desc: p.editorial_summary?.overview || "",
+    descPending: !p.editorial_summary?.overview,
     isReal:true,
   };
 }
@@ -70,60 +76,44 @@ function isDateAppropriate(place) {
 async function fetchPlacesByCity(city, cat) {
   const query = `${CAT_QUERY[cat]||cat} in ${city}`;
   const type  = CAT_TYPE[cat]||"establishment";
-  const url   = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&type=${type}&key=${PLACES_KEY}`;
-  const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
-  try {
-    const res    = await fetch(proxy);
-    const data   = await res.json();
-    const parsed = JSON.parse(data.contents);
-    const results = (parsed.results || []).filter(isDateAppropriate);
-    return results.slice(0, 12);
-  } catch(e) { console.warn("Places fetch failed:", e); return []; }
+  // Use nearbysearch with fields including editorial_summary for descriptions
+  const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&type=${type}&key=${PLACES_KEY}`;
+  const proxies = [
+    { url:`https://corsproxy.io/?${encodeURIComponent(url)}`, parse:r=>r },
+    { url:`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`, parse:r=>JSON.parse(r.contents) },
+  ];
+  for (const proxy of proxies) {
+    try {
+      const res = await fetch(proxy.url, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) continue;
+      const raw = await res.json();
+      const parsed = proxy.parse(raw);
+      const results = (parsed.results||[]).filter(isDateAppropriate);
+      if (results.length > 0) return results.slice(0, 12);
+    } catch { continue; }
+  }
+  return [];
 }
 
-// Eventbrite — live events near a city
-async function fetchEventbriteEvents(city) {
-  console.log("Fetching Eventbrite events for:", city);
-  if (!EB_KEY) { console.warn("No EB_KEY"); return []; }
-  // Geocode city first to get lat/lng
-  const geoUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(city)}&key=${PLACES_KEY}`;
-  try {
-    const geoRes  = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(geoUrl)}`);
-    const geoData = await geoRes.json();
-    const geoP    = JSON.parse(geoData.contents);
-    const loc     = geoP.results?.[0]?.geometry?.location;
-    if (!loc) return [];
-    const lat = loc.lat, lng = loc.lng;
-    // Eventbrite v3 API with private token
-    const evUrl = `https://www.eventbriteapi.com/v3/events/search/?location.latitude=${lat}&location.longitude=${lng}&location.within=15mi&expand=venue,category,logo&sort_by=best&token=${EB_KEY}`;
-    const evRes  = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(evUrl)}`);
-    const evData = await evRes.json();
-    const evP    = JSON.parse(evData.contents);
-    if (evP.error) console.warn("Eventbrite error:", evP.error_description);
-    return (evP.events || []).slice(0, 12).map(e => ({
-      id:         e.id,
-      name:       e.name?.text || "Event",
-      cat:        "events",
-      tag:        "Live Event",
-      address:    e.venue?.address?.localized_address_display || city,
-      rating:     4.5,
-      reviews:    0,
-      price:      e.is_free ? "Free" : "$$",
-      noise:      "moderate",
-      isOpen:     true,
-      photoUrl:   e.logo?.url || null,
-      emoji:      "🎭",
-      eventStart: e.start?.local ? new Date(e.start.local).toLocaleString("en-US",{weekday:"short",month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}) : "",
-      dg:         "linear-gradient(160deg,#0A1A35,#122850)",
-      lg:         "linear-gradient(160deg,#EEF4FF,#DDEAFF)",
-      desc:       e.description?.text?.slice(0,120) || e.name?.text || "",
-      url:        e.url,
-      isReal:     true,
-    }));
-  } catch(e) { console.warn("Eventbrite fetch failed:", e); return []; }
+// Fetch Place Details for description, hours, busy times
+async function fetchPlaceDetails(placeId) {
+  const fields = "editorial_summary,opening_hours,current_opening_hours,website,formatted_phone_number,price_level,user_ratings_total,serves_beer,serves_wine,serves_cocktails,reservable,curbside_pickup,delivery,dine_in,takeout";
+  const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=${fields}&key=${PLACES_KEY}`;
+  const proxies = [
+    { url:`https://corsproxy.io/?${encodeURIComponent(url)}`, parse:r=>r },
+    { url:`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`, parse:r=>JSON.parse(r.contents) },
+  ];
+  for (const proxy of proxies) {
+    try {
+      const res = await fetch(proxy.url, { signal: AbortSignal.timeout(6000) });
+      if (!res.ok) continue;
+      const raw = await res.json();
+      const parsed = proxy.parse(raw);
+      if (parsed.result) return parsed.result;
+    } catch { continue; }
+  }
+  return null;
 }
-
-
 
 /* ── DATA ────────────────────────────────────────────────── */
 const STAGES = [
@@ -134,23 +124,22 @@ const STAGES = [
 ];
 const CATEGORIES = [
   { id:"restaurants", label:"Restaurants",  emoji:"🍽️", desc:"Dining for every mood",          dg:"linear-gradient(145deg,#4A0E0E,#2A0602)", lg:"linear-gradient(145deg,#FFF0F0,#FFDEDE)" },
-  { id:"events",      label:"Live Events",  emoji:"🎭", desc:"Concerts, comedy & shows",       dg:"linear-gradient(145deg,#0E1A2A,#060E18)", lg:"linear-gradient(145deg,#F0F4FF,#DEE8FF)" },
   { id:"nightlife",   label:"Nightlife",    emoji:"🌙", desc:"Bars, clubs & late nights",      dg:"linear-gradient(145deg,#14082A,#0A0418)", lg:"linear-gradient(145deg,#F4F0FF,#E8DEFF)" },
   { id:"experiences", label:"Experiences", emoji:"✨", desc:"Activities, outdoors & more",    dg:"linear-gradient(145deg,#2A1A08,#180E04)", lg:"linear-gradient(145deg,#FFFAF0,#FFF0DE)" },
   { id:"questions",   label:"Questions",   emoji:"💬", desc:"Spark great conversation",       dg:"linear-gradient(145deg,#2A080E,#180406)", lg:"linear-gradient(145deg,#FFF0F2,#FFDDE2)" },
 ];
 const SPOTS = [
   { id:1,  name:"Maison Rouge",        cat:"restaurants",  price:"$$$", rating:4.9, noise:"quiet",    tag:"Fine Dining",    dg:"linear-gradient(160deg,#3A0808,#600E10)", lg:"linear-gradient(160deg,#FFF0F0,#FFDEDE)", emoji:"🕯️", hours:["5:00 PM","11:00 PM"], desc:"French-inspired tasting menu in a candlelit townhouse. Intimate and unforgettable." },
-  { id:2,  name:"The Night Garden",    cat:"events",       price:"$$",  rating:4.8, noise:"moderate", tag:"Live Jazz",      dg:"linear-gradient(160deg,#0A1A35,#122850)", lg:"linear-gradient(160deg,#EEF4FF,#DDEAFF)", emoji:"🎵", eventStart:"Fri & Sat · 7:00 PM", desc:"Outdoor jazz under string lights every weekend evening." },
+
   { id:3,  name:"Velvet Lounge",       cat:"nightlife",    price:"$$$", rating:4.7, noise:"loud",     tag:"Cocktail Bar",   dg:"linear-gradient(160deg,#180A35,#28145A)", lg:"linear-gradient(160deg,#F4F0FF,#EAE2FF)", emoji:"🌙", hours:["8:00 PM","2:00 AM"],  desc:"Intimate underground bar with handcrafted cocktails and velvet booths." },
   { id:4,  name:"Ember & Ash",         cat:"restaurants",  price:"$$",  rating:4.8, noise:"moderate", tag:"Wood-fire",      dg:"linear-gradient(160deg,#3A1808,#5A2A10)", lg:"linear-gradient(160deg,#FFF4EE,#FFE4D4)", emoji:"🔥", hours:["4:30 PM","10:00 PM"], desc:"Wood-fired seasonal dishes in a warm courtyard setting." },
   { id:5,  name:"Moonlight Cruise",    cat:"experiences",  price:"$$$", rating:4.9, noise:"quiet",    tag:"Sunset Sail",    dg:"linear-gradient(160deg,#0A1E35,#103050)", lg:"linear-gradient(160deg,#EEF6FF,#DCEDFF)", emoji:"⛵", desc:"Private harbor cruise at golden hour with champagne for two." },
-  { id:6,  name:"Jazz on the Lawn",    cat:"events",       price:"$$",  rating:4.9, noise:"moderate", tag:"Outdoor Music",  dg:"linear-gradient(160deg,#0E2A10,#184020)", lg:"linear-gradient(160deg,#EFFFEF,#DCFFDC)", emoji:"🎺", eventStart:"Saturdays · 6:30 PM", desc:"Weekly jazz with food trucks and blankets for two." },
+
   { id:7,  name:"Sweet Surrender",     cat:"dessert",      price:"$$",  rating:4.9, noise:"quiet",    tag:"Dessert Bar",    dg:"linear-gradient(160deg,#3A0A18,#5A1028)", lg:"linear-gradient(160deg,#FFF0F6,#FFDDED)", emoji:"🍫", hours:["12:00 PM","12:00 AM"], desc:"Chocolate fondue and dessert flights until midnight." },
   { id:8,  name:"Stargazer Rooftop",   cat:"nightlife",    price:"$$",  rating:4.8, noise:"moderate", tag:"Rooftop Bar",    dg:"linear-gradient(160deg,#14103A,#201858)", lg:"linear-gradient(160deg,#F2F0FF,#E6E2FF)", emoji:"🔭", hours:["5:00 PM","1:00 AM"],  desc:"Open-air rooftop with telescopes, star maps, and craft cocktails." },
   { id:9,  name:"Botanical Picnic",    cat:"outdoors",     price:"$$",  rating:4.8, noise:"quiet",    tag:"Picnic",         dg:"linear-gradient(160deg,#0A2A14,#124020)", lg:"linear-gradient(160deg,#EEFFF4,#DCFFE8)", emoji:"🧺", desc:"Pre-arranged luxury picnic — flowers, food, blankets." },
   { id:10, name:"Canvas & Cuvée",      cat:"experiences",  price:"$$",  rating:4.7, noise:"moderate", tag:"Paint & Wine",   dg:"linear-gradient(160deg,#2A1A08,#402810)", lg:"linear-gradient(160deg,#FFFAEE,#FFF2D4)", emoji:"🎨", desc:"Paint side by side with wine. Take your art home." },
-  { id:11, name:"The Comedy Cellar",   cat:"events",       price:"$$",  rating:4.8, noise:"loud",     tag:"Stand-up",       dg:"linear-gradient(160deg,#2A0A14,#3A0E20)", lg:"linear-gradient(160deg,#FFF0F6,#FFDDED)", emoji:"🎤", eventStart:"Nightly · 8:00 & 10:30 PM", desc:"Underground comedy club. Two-drink minimum, guaranteed laughs." },
+
   { id:12, name:"Rosario's Trattoria", cat:"restaurants",  price:"$$",  rating:4.7, noise:"moderate", tag:"Italian",        dg:"linear-gradient(160deg,#3A0A08,#5A1810)", lg:"linear-gradient(160deg,#FFF4F0,#FFE4DC)", emoji:"🍝", hours:["11:30 AM","10:00 PM"], desc:"Handmade pasta, a fireplace, and a wine list that never disappoints." },
 ];
 const QUESTIONS = {
@@ -323,8 +312,6 @@ function Settings({T, onBack, user}) {
     </button>
   );
 
-
-
   const [prefCity, setPrefCity] = useState("Tampa, FL");
   const [prefCityInput, setPrefCityInput] = useState("Tampa, FL");
   if (sec==="preferences") return (
@@ -403,7 +390,7 @@ function Settings({T, onBack, user}) {
       </div>
       {[
         {t:"Our Mission",b:"First Date was built for everyone — from the nervous first-dater who doesn't know where to start, to the married couple who wants to rediscover why they fell in love. We believe great dates don't happen by accident. They happen when someone cares enough to plan one."},
-        {t:"What We Do",b:"We're your personal date night wingman. We find the best restaurants, experiences, and live events near you, help you build a full itinerary, and give you conversation starters so the night flows naturally."},
+        {t:"What We Do",b:"We're your personal date night wingman. We find the best restaurants, bars, and experiences near you, help you build a full itinerary, and give you conversation starters so the night flows naturally."},
         {t:"Our Promise",b:"First Date is built independently. We don't sell your data, we don't show ads, and we're always working to make your experience better."},
       ].map((s,i)=>(
         <div key={i} style={{background:T.surface,borderRadius:16,padding:"18px",marginBottom:12,border:`1px solid ${T.borderSub}`}}>
@@ -442,7 +429,7 @@ function Settings({T, onBack, user}) {
         ["2. How We Use Your Information","Your information is used to personalize your experience, show relevant date spots near your location, remember your saved spots and date plans, and send optional notifications if you opt in. We do not use your data for advertising."],
         ["3. Location Data","First Date requests your location to find nearby restaurants, events, and experiences. Location data is used in real time and is never stored on our servers. You can revoke location access at any time in your device settings."],
         ["4. Data Storage & Security","Your account data is stored securely using industry-standard encryption. We do not sell your personal data to any third party under any circumstances."],
-        ["5. Third-Party Services","We use Google Places API for venue discovery and Eventbrite for live events. Each service has their own privacy policy."],
+        ["5. Third-Party Services","We use Google Places API for venue discovery. See their privacy policy for details."],
         ["6. Your Rights","You may access, correct, or delete your personal data at any time via Settings → Account. We process all deletion requests within 30 days."],
         ["7. Children's Privacy","First Date is for users 17 and older. We do not knowingly collect information from minors."],
         ["8. Contact","Questions about this policy? Email privacy@firstdateapp.com — we respond within 5 business days."],
@@ -470,18 +457,47 @@ function Settings({T, onBack, user}) {
 }
 
 /* ── DETAIL SHEET ────────────────────────────────────────── */
-function DetailSheet({spot,onClose,inPlan,onAdd,onRemove,saved,onSave,T,openWeb}) {
+function DetailSheet({spot,onClose,inPlan,onAdd,onRemove,saved,onSave,T,extra}) {
+  const [photoIdx, setPhotoIdx] = React.useState(0);
+  React.useEffect(()=>{ if(spot) setPhotoIdx(0); }, [spot?.id]);
   if (!spot) return null;
   const g = T.isDark ? spot.dg : spot.lg;
   return (
     <div style={{position:"fixed",inset:0,zIndex:700,background:"rgba(0,0,0,0.55)",backdropFilter:"blur(6px)",display:"flex",alignItems:"flex-end",justifyContent:"center"}} onClick={onClose}>
       <div onClick={e=>e.stopPropagation()} style={{background:T.surface,borderRadius:"24px 24px 0 0",width:"100%",maxWidth:480,maxHeight:"90vh",overflowY:"auto",animation:"sheetUp 0.28s ease"}}>
-        <div style={{height:190,background:g,borderRadius:"24px 24px 0 0",display:"flex",alignItems:"center",justifyContent:"center",fontSize:76,position:"relative"}}>
-          {spot.emoji}
-          <div style={{position:"absolute",inset:0,background:T.isDark?"linear-gradient(to top,rgba(0,0,0,0.7),transparent)":"linear-gradient(to top,rgba(255,255,255,0.5),transparent)",borderRadius:"24px 24px 0 0"}}/>
-          <button onClick={onClose} style={{position:"absolute",top:14,left:14,background:"rgba(0,0,0,0.4)",border:"none",borderRadius:"50%",width:34,height:34,color:"#fff",fontSize:16,cursor:"pointer",backdropFilter:"blur(4px)"}}>←</button>
-          <button onClick={onSave} style={{position:"absolute",top:14,right:14,background:"rgba(0,0,0,0.4)",border:"none",borderRadius:"50%",width:34,height:34,fontSize:18,cursor:"pointer",backdropFilter:"blur(4px)"}}>{saved?"❤️":"🤍"}</button>
-          <div style={{position:"absolute",bottom:14,left:18}}>
+        {/* Photo Gallery */}
+        <div style={{height:240,background:g,borderRadius:"24px 24px 0 0",position:"relative",overflow:"hidden"}}>
+          {spot.photos && spot.photos.length>0 ? (
+            <>
+              <img key={photoIdx} src={spot.photos[photoIdx]} alt={spot.name}
+                style={{width:"100%",height:"100%",objectFit:"cover",position:"absolute",inset:0}}
+                onError={e=>{e.target.style.display='none'}} />
+              {/* Photo dots */}
+              {spot.photos.length>1&&(
+                <div style={{position:"absolute",bottom:54,left:"50%",transform:"translateX(-50%)",display:"flex",gap:5,zIndex:4}}>
+                  {spot.photos.map((_,i)=>(
+                    <div key={i} onClick={()=>setPhotoIdx(i)}
+                      style={{width:i===photoIdx?18:6,height:6,borderRadius:3,background:i===photoIdx?"#fff":"rgba(255,255,255,0.45)",cursor:"pointer",transition:"all 0.2s"}}/>
+                  ))}
+                </div>
+              )}
+              {/* Prev/Next arrows */}
+              {photoIdx>0&&(
+                <button onClick={e=>{e.stopPropagation();setPhotoIdx(i=>i-1);}}
+                  style={{position:"absolute",left:12,top:"50%",transform:"translateY(-50%)",background:"rgba(0,0,0,0.45)",border:"none",borderRadius:"50%",width:32,height:32,color:"#fff",fontSize:14,cursor:"pointer",zIndex:4,display:"flex",alignItems:"center",justifyContent:"center"}}>‹</button>
+              )}
+              {photoIdx<spot.photos.length-1&&(
+                <button onClick={e=>{e.stopPropagation();setPhotoIdx(i=>i+1);}}
+                  style={{position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",background:"rgba(0,0,0,0.45)",border:"none",borderRadius:"50%",width:32,height:32,color:"#fff",fontSize:14,cursor:"pointer",zIndex:4,display:"flex",alignItems:"center",justifyContent:"center"}}>›</button>
+              )}
+            </>
+          ) : (
+            <div style={{width:"100%",height:"100%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:76}}>{spot.emoji}</div>
+          )}
+          <div style={{position:"absolute",inset:0,background:"linear-gradient(to top,rgba(0,0,0,0.8),transparent 50%)",zIndex:2,pointerEvents:"none"}}/>
+          <button onClick={onClose} style={{position:"absolute",top:14,left:14,background:"rgba(0,0,0,0.5)",border:"none",borderRadius:"50%",width:34,height:34,color:"#fff",fontSize:16,cursor:"pointer",backdropFilter:"blur(4px)",zIndex:3}}>←</button>
+          <button onClick={onSave} style={{position:"absolute",top:14,right:14,background:"rgba(0,0,0,0.5)",border:"none",borderRadius:"50%",width:34,height:34,fontSize:18,cursor:"pointer",backdropFilter:"blur(4px)",zIndex:3}}>{saved?"❤️":"🤍"}</button>
+          <div style={{position:"absolute",bottom:14,left:18,zIndex:3}}>
             <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:10,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:"rgba(255,255,255,0.65)",marginBottom:2}}>{spot.tag}</div>
             <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:24,fontWeight:700,color:"#fff"}}>{spot.name}</div>
           </div>
@@ -495,14 +511,7 @@ function DetailSheet({spot,onClose,inPlan,onAdd,onRemove,saved,onSave,T,openWeb}
               <span>🕐</span><div><div style={{fontFamily:"'DM Sans',sans-serif",fontSize:10,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:T.muted,marginBottom:1}}>Hours Today</div><div style={{fontFamily:"'DM Sans',sans-serif",fontSize:13,fontWeight:600,color:T.text}}>{spot.hours[0]} – {spot.hours[1]}</div></div>
             </div>
           )}
-          {spot.cat==="events"&&spot.eventStart&&(
-            <div style={{display:"flex",gap:10,alignItems:"center",background:T.faint,borderRadius:12,padding:"10px 14px",marginBottom:12}}>
-              <span>📅</span><div><div style={{fontFamily:"'DM Sans',sans-serif",fontSize:10,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:T.muted,marginBottom:1}}>Event Start</div><div style={{fontFamily:"'DM Sans',sans-serif",fontSize:13,fontWeight:600,color:T.text}}>{spot.eventStart}</div></div>
-            </div>
-          )}
           <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:14,color:T.textMid,lineHeight:1.65,marginBottom:18}}>{spot.desc}</p>
-          
-          {spot.cat==="events"&&<button onClick={()=>openWeb(eventbriteUrl(spot),`${spot.name} — Tickets`)} style={{display:"block",width:"100%",background:T.faint,border:`1px solid ${T.border}`,borderRadius:12,padding:"12px",fontFamily:"'DM Sans',sans-serif",fontSize:12,fontWeight:700,color:T.text,marginBottom:12,textAlign:"center",cursor:"pointer"}}>🎟️ Get Tickets on Eventbrite</button>}
           <button onClick={()=>{inPlan?onRemove():onAdd();onClose();}} style={{width:"100%",background:inPlan?"transparent":T.grad,color:inPlan?T.red:"#fff",border:inPlan?`1.5px solid ${T.red}`:"none",borderRadius:14,padding:"15px",fontFamily:"'DM Sans',sans-serif",fontSize:15,fontWeight:800,cursor:"pointer"}}>
             {inPlan?"✓ Remove from Date Plan":"+ Add to Date Plan"}
           </button>
@@ -521,7 +530,7 @@ function SpotCard({spot,inPlan,onAdd,onRemove,saved,onSave,onClick,T}) {
       onMouseLeave={e=>{e.currentTarget.style.transform="";e.currentTarget.style.borderColor=T.borderSub;}}>
       <div style={{height:110,position:"relative",overflow:"hidden",display:"flex",alignItems:"center",justifyContent:"center",fontSize:48}}>
         {spot.photoUrl
-          ? <img src={spot.photoUrl} alt={spot.name} style={{width:"100%",height:"100%",objectFit:"cover",position:"absolute",inset:0}} onError={e=>e.target.style.display="none"}/>
+          ? <img src={spot.photoUrl} alt={spot.name} style={{width:"100%",height:"100%",objectFit:"cover",position:"absolute",inset:0}} onError={e=>{e.target.style.display='none'}} />
           : spot.emoji}
         <button onClick={e=>{e.stopPropagation();onSave();}} style={{position:"absolute",top:8,right:8,background:"rgba(0,0,0,0.3)",border:"none",borderRadius:"50%",width:28,height:28,fontSize:14,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",backdropFilter:"blur(4px)"}}>
           {saved?"❤️":"🤍"}
@@ -533,7 +542,7 @@ function SpotCard({spot,inPlan,onAdd,onRemove,saved,onSave,onClick,T}) {
         <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:15,fontWeight:700,color:T.text,marginBottom:4,lineHeight:1.2}}>{spot.name}</div>
         <div style={{marginBottom:5}}><NoiseBadge noise={spot.noise}/></div>
         {spot.cat==="restaurants"&&spot.hours&&<div style={{fontFamily:"'DM Sans',sans-serif",fontSize:9,color:T.red,fontWeight:700,marginBottom:4}}>🕐 {spot.hours[0]} – {spot.hours[1]}</div>}
-        {spot.cat==="events"&&spot.eventStart&&<div style={{fontFamily:"'DM Sans',sans-serif",fontSize:9,color:T.red,fontWeight:700,marginBottom:4}}>📅 {spot.eventStart}</div>}
+        
         <div style={{display:"flex",gap:5,alignItems:"center",marginBottom:8}}><Star r={spot.rating} T={T}/><span style={{fontFamily:"'DM Sans',sans-serif",fontSize:10,fontWeight:700,color:T.red}}>{spot.price}</span></div>
         <button onClick={e=>{e.stopPropagation();inPlan?onRemove():onAdd();}} style={{width:"100%",background:inPlan?"transparent":T.grad,color:inPlan?T.red:"#fff",border:inPlan?`1.5px solid ${T.red}`:"none",borderRadius:10,padding:"8px",fontFamily:"'DM Sans',sans-serif",fontSize:11,fontWeight:700,cursor:"pointer"}}>
           {inPlan?"✓ Added":"+ Add to Plan"}
@@ -546,7 +555,7 @@ function SpotCard({spot,inPlan,onAdd,onRemove,saved,onSave,onClick,T}) {
 /* ── MAIN APP ────────────────────────────────────────────── */
 
 /* ── CITY SEARCH — fully uncontrolled input, immune to re-renders ── */
-function CitySearch({ initialCity, onCommit }) {
+function CitySearch({ initialCity, onCommit, compact }) {
   const inputRef   = typeof document !== "undefined" ? (() => { const r = {current:null}; return r; })() : {current:null};
   const [sugg, setSugg]       = useState([]);
   const [showSugg, setShowSugg] = useState(false);
@@ -574,7 +583,7 @@ function CitySearch({ initialCity, onCommit }) {
         setSugg(list);
         setShowSugg(list.length > 0);
       } catch { setSugg([]); }
-    }, 400);
+    }, 150);
   };
 
   const commit = (city) => {
@@ -754,6 +763,34 @@ function InAppBrowser({url, title, onClose, T}) {
 /* ── LOCATION PROMPT — outside App, stable across re-renders ── */
 function LocationPrompt({show, onClose, onAllow, onTypeCity, T}) {
   const [showManual, setShowManual] = useState(false);
+  const [locSugg, setLocSugg] = useState([]);
+  const [showLocSugg, setShowLocSugg] = useState(false);
+  const locTimer = typeof window!=="undefined" ? (window.__lpTimer||(window.__lpTimer={t:null})) : {t:null};
+
+  const fetchLocSugg = async (text) => {
+    clearTimeout(locTimer.t);
+    if (!text || text.length < 2) { setLocSugg([]); setShowLocSugg(false); return; }
+    locTimer.t = setTimeout(async () => {
+      const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(text)}&types=(cities)&key=${PLACES_KEY}`;
+      const proxies = [
+        { url:`https://corsproxy.io/?${encodeURIComponent(url)}`, parse:r=>r },
+        { url:`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`, parse:r=>JSON.parse(r.contents) },
+      ];
+      for (const proxy of proxies) {
+        try {
+          const res = await fetch(proxy.url, {signal:AbortSignal.timeout(5000)});
+          const raw = await res.json();
+          const json = proxy.parse(raw);
+          if (json?.predictions?.length > 0) {
+            setLocSugg(json.predictions.slice(0,5).map(p=>p.description));
+            setShowLocSugg(true);
+            return;
+          }
+        } catch { continue; }
+      }
+    }, 150);
+  };
+
   if (!show) return null;
   return (
     <>
@@ -781,23 +818,65 @@ function LocationPrompt({show, onClose, onAllow, onTypeCity, T}) {
           </>
         ) : (
           <>
-            <div style={{display:"flex",gap:8,marginBottom:12}}>
-              <input
-                autoFocus
-                id="fd-manual-city"
-                defaultValue=""
-                placeholder="e.g. Atlanta, GA"
-                onKeyDown={e=>{ if(e.key==="Enter"){ const v=e.target.value.trim(); if(v){onTypeCity(v);setShowManual(false);} }}}
-                style={{flex:1,background:T.surface,border:`1.5px solid ${T.border}`,borderRadius:12,padding:"13px 14px",fontFamily:"'DM Sans',sans-serif",fontSize:14,color:T.text,outline:"none"}}/>
-              <button
-                onClick={()=>{ const v=document.getElementById("fd-manual-city")?.value?.trim(); if(v){onTypeCity(v);setShowManual(false);} }}
-                style={{background:T.grad,color:"#fff",border:"none",borderRadius:12,padding:"13px 18px",fontFamily:"'DM Sans',sans-serif",fontSize:13,fontWeight:800,cursor:"pointer"}}>Go</button>
+            <div style={{position:"relative",marginBottom:12}}>
+              <div style={{display:"flex",gap:8}}>
+                <input
+                  autoFocus
+                  id="fd-manual-city"
+                  defaultValue=""
+                  placeholder="e.g. Dallas, TX"
+                  onChange={e=>fetchLocSugg(e.target.value)}
+                  onBlur={()=>setTimeout(()=>setShowLocSugg(false),200)}
+                  onKeyDown={e=>{ if(e.key==="Enter"){ const v=e.target.value.trim(); if(v){onTypeCity(v);setShowManual(false);setShowLocSugg(false);} }}}
+                  style={{flex:1,background:T.surface,border:`1.5px solid ${T.border}`,borderRadius:12,padding:"13px 14px",fontFamily:"'DM Sans',sans-serif",fontSize:16,color:T.text,outline:"none"}}/>
+                <button
+                  onClick={()=>{ const v=document.getElementById("fd-manual-city")?.value?.trim(); if(v){onTypeCity(v);setShowManual(false);} }}
+                  style={{background:T.grad,color:"#fff",border:"none",borderRadius:12,padding:"13px 18px",fontFamily:"'DM Sans',sans-serif",fontSize:13,fontWeight:800,cursor:"pointer",flexShrink:0}}>Go</button>
+              </div>
+              {showLocSugg && locSugg.length>0 && (
+                <div style={{position:"absolute",top:"calc(100% + 4px)",left:0,right:60,background:T.card,border:`1px solid ${T.border}`,borderRadius:12,zIndex:900,overflow:"hidden",boxShadow:"0 8px 28px rgba(0,0,0,0.4)"}}>
+                  {locSugg.map((s,i)=>(
+                    <div key={i} onMouseDown={()=>{document.getElementById("fd-manual-city").value=s;onTypeCity(s);setShowManual(false);setShowLocSugg(false);}}
+                      style={{padding:"12px 14px",fontFamily:"'DM Sans',sans-serif",fontSize:13,color:T.text,cursor:"pointer",borderBottom:i<locSugg.length-1?`1px solid ${T.borderSub}`:"none",display:"flex",alignItems:"center",gap:10}}
+                      onMouseEnter={e=>e.currentTarget.style.background="rgba(245,236,216,0.07)"}
+                      onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                      <span style={{fontSize:12}}>📍</span>{s}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
-            <button onClick={()=>setShowManual(false)} style={{width:"100%",background:"transparent",border:"none",fontFamily:"'DM Sans',sans-serif",fontSize:13,color:T.muted,cursor:"pointer",marginTop:8}}>← Back</button>
+            <button onClick={()=>setShowManual(false)} style={{width:"100%",background:"transparent",border:"none",fontFamily:"'DM Sans',sans-serif",fontSize:13,color:T.muted,cursor:"pointer",marginTop:4}}>← Back</button>
           </>
         )}
       </div>
     </>
+  );
+}
+
+/* ── CATEGORY CARD ───────────────────────────────────────── */
+const CAT_PHOTOS = {
+  restaurants: "https://images.unsplash.com/photo-1414235077428-338989a2e8c0?w=400&q=80",
+  nightlife:   "https://images.unsplash.com/photo-1566737236500-c8ac43014a67?w=400&q=80",
+  experiences: "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=400&q=80",
+  questions:   "https://images.unsplash.com/photo-1516589091380-5d8e87df6999?w=400&q=80",
+};
+function CatCard({ cat, T, onPress }) {
+  const photo = CAT_PHOTOS[cat.id];
+  return (
+    <div className="cat-card" onClick={onPress}
+      style={{position:"relative",minHeight:110,overflow:"hidden",background:T.isDark?cat.dg:cat.lg}}>
+      {photo && (
+        <img src={photo} alt={cat.label}
+          style={{position:"absolute",inset:0,width:"100%",height:"100%",objectFit:"cover",opacity:0.6}}
+          onError={e=>{e.target.style.display='none'}} />
+      )}
+      <div style={{position:"absolute",inset:0,background:"linear-gradient(to top,rgba(0,0,0,0.75),rgba(0,0,0,0.1))"}}/>
+      <div style={{position:"relative",zIndex:1,padding:"12px 14px",display:"flex",flexDirection:"column",justifyContent:"flex-end",minHeight:110}}>
+        <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:18,fontWeight:700,color:"#fff",lineHeight:1.1,marginBottom:3}}>{cat.label}</div>
+        <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:10,color:"rgba(255,255,255,0.75)",lineHeight:1.4}}>{cat.desc}</div>
+      </div>
+    </div>
   );
 }
 
@@ -829,14 +908,13 @@ export default function App() {
   const [city, setCity]                     = useState("");
   const [cityInput, setCityInput]           = useState("");
 
-
   const [placesCache, setPlacesCache] = useState({}); // { "city|cat": [spots] }
   const [placesLoading, setPlacesLoading] = useState(false);
   const [realSpots, setRealSpots] = useState([]);
+  const [enrichedDetails, setEnrichedDetails] = useState({}); // placeId -> extra details
   const [webView, setWebView] = useState(null); // {url, title}
   const openWeb = (url, title) => setWebView({url, title});
   const closeWeb = () => setWebView(null);
-
 
   const loadPlaces = async (cityVal, catVal) => {
     if (!cityVal) return;
@@ -845,13 +923,8 @@ export default function App() {
     if (placesCache[key]) { setRealSpots(placesCache[key]); return; }
     setPlacesLoading(true);
     let transformed = [];
-    if (effectiveCat === "events") {
-      // Use Eventbrite for live events
-      transformed = await fetchEventbriteEvents(cityVal);
-    } else {
-      const raw = await fetchPlacesByCity(cityVal, effectiveCat);
-      transformed = raw.map(p => transformGPlace(p, effectiveCat));
-    }
+    const raw = await fetchPlacesByCity(cityVal, effectiveCat);
+    transformed = raw.map(p => transformGPlace(p, effectiveCat));
     setPlacesCache(prev => ({...prev, [key]: transformed}));
     setRealSpots(transformed);
     setPlacesLoading(false);
@@ -1031,7 +1104,6 @@ export default function App() {
 
   // LocationPrompt moved outside App — rendered below with props
 
-
   const hamBtn = (
     <button onClick={()=>setShowSettings(true)} style={{background:T.red,border:"none",borderRadius:12,width:40,height:40,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",flexShrink:0,flexDirection:"column",gap:4.5,padding:0}}>
       {[0,1,2].map(i=><div key={i} style={{width:16,height:1.5,background:"#fff",borderRadius:2}}/>)}
@@ -1043,6 +1115,8 @@ export default function App() {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;0,700;1,400;1,600;1,700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700;9..40,800&family=Playfair+Display:ital,wght@0,700;0,800;1,700;1,800&display=swap');
         *{box-sizing:border-box;margin:0;padding:0}
+        html,body{width:100%;overflow-x:hidden;background:#250902;}
+        #root{display:flex;flex-direction:column;align-items:center;min-height:100vh;background:#250902;}
         ::-webkit-scrollbar{width:2px;height:2px}
         ::-webkit-scrollbar-thumb{background:${T.border};border-radius:10px}
         @keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
@@ -1064,8 +1138,6 @@ export default function App() {
         .q-opt:hover{background:rgba(128,14,19,0.1);border-color:${T.red};transform:translateX(4px)}
         input::placeholder,textarea::placeholder{color:${T.muted}}
       `}</style>
-
-      <InAppBrowser url={webView?.url} title={webView?.title} onClose={closeWeb} T={T}/>
       <DetailSheet spot={detail} onClose={()=>setDetail(null)} T={T}
         inPlan={detail?inPlan(detail.id):false} onAdd={()=>detail&&addStop(detail)} onRemove={()=>detail&&remStop(detail.id)}
         saved={detail?isSaved(detail.id):false} onSave={()=>detail&&togSave(detail.id)}/>
@@ -1106,7 +1178,7 @@ export default function App() {
             <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:10,fontWeight:700,letterSpacing:"0.22em",textTransform:"uppercase",color:T.red,marginBottom:8}}>
               {user ? `Hey ${user.name} 👋` : "Your Ultimate Wingman"}
               {city
-                ? <span style={{color:T.muted,fontWeight:500}}> · 📍 {city}</span>
+                ? <span onClick={()=>setShowLocPrompt(true)} style={{color:T.muted,fontWeight:600,cursor:"pointer"}}> · 📍 {city} <span style={{fontSize:9,color:T.red}}>✎</span></span>
                 : <span onClick={()=>setShowLocPrompt(true)} style={{color:T.muted,fontWeight:600,cursor:"pointer",textDecoration:"underline",textDecorationStyle:"dotted"}}> · 📍 Set your location</span>
               }
             </div>
@@ -1133,11 +1205,7 @@ export default function App() {
           </div>
           <div style={{padding:"0 20px 22px",display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
             {CATEGORIES.map(cat=>(
-              <div key={cat.id} className="cat-card" onClick={()=>{cat.id==="questions"?setTab("questions"):(setBrowseCat(cat.id),setTab("browse"));}} style={{background:T.isDark?cat.dg:cat.lg,padding:"18px 16px 16px",minHeight:100}}>
-                <div style={{fontSize:24,marginBottom:7}}>{cat.emoji}</div>
-                <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:17,fontWeight:700,color:T.text,lineHeight:1.1,marginBottom:2}}>{cat.label}</div>
-                <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:10,color:T.muted,lineHeight:1.4}}>{cat.desc}</div>
-              </div>
+              <CatCard key={cat.id} cat={cat} T={T} onPress={()=>{cat.id==="questions"?setTab("questions"):(setBrowseCat(cat.id),setTab("browse"));}}/>
             ))}
           </div>
           <div style={{padding:"0 20px 12px",fontFamily:"'DM Sans',sans-serif",fontSize:11,fontWeight:700,letterSpacing:"0.14em",textTransform:"uppercase",color:T.muted}}>Recommended Tonight</div>
@@ -1147,7 +1215,7 @@ export default function App() {
                 onMouseEnter={e=>e.currentTarget.style.transform="translateY(-2px)"} onMouseLeave={e=>e.currentTarget.style.transform=""}>
                 <div style={{height:90,position:"relative",overflow:"hidden",display:"flex",alignItems:"center",justifyContent:"center",fontSize:36}}>
                   {spot.photoUrl
-                    ?<img src={spot.photoUrl} alt={spot.name} style={{width:"100%",height:"100%",objectFit:"cover",position:"absolute",inset:0}} onError={e=>e.target.style.display="none"}/>
+                    ?<img src={spot.photoUrl} alt={spot.name} style={{width:"100%",height:"100%",objectFit:"cover",position:"absolute",inset:0}} onError={e=>{e.target.style.display='none'}} />
                     :spot.emoji}
                 </div>
                 <div style={{padding:"6px 10px 12px"}}>
@@ -1165,22 +1233,19 @@ export default function App() {
       {tab==="browse"&&!surpriseOn&&(
         <div className="fu">
           <div style={{padding:"52px 20px 0",background:T.surface,borderBottom:`1px solid ${T.borderSub}`}}>
-            {/* City search with autocomplete */}
-            <CitySearch
-              initialCity={cityInput}
-              onCommit={(newCity)=>{
-                setCityInput(newCity); setCity(newCity);
-                loadPlaces(newCity, browseCat);
-                setTimeout(()=>preloadAllCats(newCity), 600);
-              }}
-              T={T}
-            />
-            <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:14}}>
-              <div style={{position:"relative",flex:1}}>
-                <span style={{position:"absolute",left:13,top:"50%",transform:"translateY(-50%)",fontSize:14,color:T.muted}}>🔍</span>
-                <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search spots…" style={{width:"100%",background:T.card,border:`1px solid ${T.border}`,borderRadius:26,padding:"11px 14px 11px 38px",fontFamily:"'DM Sans',sans-serif",fontSize:13,color:T.text,outline:"none"}}/>
-              </div>
-              <button onClick={()=>setSurpriseOn(true)} style={{background:"#BF834E",color:"#fff",border:"none",borderRadius:22,padding:"11px 16px",fontSize:11,fontWeight:800,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0}}>✨ Surprise</button>
+            {/* City search + Surprise on same compact row */}
+            <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:12}}>
+              <CitySearch
+                initialCity={cityInput}
+                onCommit={(newCity)=>{
+                  setCityInput(newCity); setCity(newCity);
+                  loadPlaces(newCity, browseCat);
+                  setTimeout(()=>preloadAllCats(newCity), 600);
+                }}
+                T={T}
+                compact={true}
+              />
+              <button onClick={()=>setSurpriseOn(true)} style={{background:"#BF834E",color:"#fff",border:"none",borderRadius:22,padding:"10px 14px",fontSize:11,fontWeight:800,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0,boxShadow:"0 4px 12px rgba(191,131,78,0.3)"}}>✨ Surprise</button>
             </div>
             <div style={{display:"flex",gap:8,overflowX:"auto",paddingBottom:14,scrollbarWidth:"none"}}>
               <button className={`chip ${browseCat==="all"?"on":""}`} onClick={()=>setBrowseCat("all")}>✨ All</button>
@@ -1260,14 +1325,14 @@ export default function App() {
           {sStep===99&&(
             <>
               <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:28,fontWeight:700,color:T.text,marginBottom:4}}>
-                Here's your plan ✨
+                Here are your suggestions ✨
               </div>
               <div style={{display:"inline-flex",alignItems:"center",gap:6,background:T.faint,borderRadius:20,padding:"4px 12px",marginBottom:4}}>
                 <span style={{fontSize:12}}>{({"Morning (before noon)":"☀️","Afternoon (12–5pm)":"🌤️","Evening (5–9pm)":"✨","Late Night (9pm+)":"🌙"})[sAnswers.timeofday]||"✨"}</span>
                 <span style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,fontWeight:700,color:T.muted}}>{sAnswers.timeofday||"Anytime"}</span>
               </div>
               <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:12,color:T.muted,marginBottom:18}}>
-                {sStage?`Curated for: ${STAGES.find(s=>s.id===sStage)?.emoji} ${STAGES.find(s=>s.id===sStage)?.label}`:"Add any stop to your plan"}
+                {sStage?`Curated for: ${STAGES.find(s=>s.id===sStage)?.emoji} ${STAGES.find(s=>s.id===sStage)?.label}`:"Tap any suggestion to learn more, then add it to your plan"}
               </p>
               <div style={{display:"flex",flexDirection:"column",gap:12}}>
                 {sPicks.map((v,i)=>(
@@ -1280,8 +1345,6 @@ export default function App() {
                         <div style={{display:"flex",gap:7,flexWrap:"wrap",alignItems:"center",marginBottom:8}}><NoiseBadge noise={v.noise}/><Star r={v.rating} T={T}/><span style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,fontWeight:700,color:T.red}}>{v.price}</span></div>
                         {v.cat==="restaurants"&&v.hours&&<div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:T.red,fontWeight:700,marginBottom:6}}>🕐 {v.hours[0]} – {v.hours[1]}</div>}
                         <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:13,color:T.textMid,lineHeight:1.55,marginBottom:12}}>{v.desc}</p>
-                        
-                        {v.cat==="events"&&<button onClick={()=>openWeb(eventbriteUrl(v),`${v.name} — Tickets`)} style={{display:"block",width:"100%",background:"rgba(0,0,0,0.15)",border:`1px solid ${T.border}`,borderRadius:10,padding:"9px",fontFamily:"'DM Sans',sans-serif",fontSize:12,fontWeight:700,color:T.text,marginBottom:8,textAlign:"center",cursor:"pointer"}}>🎟️ Get Tickets on Eventbrite</button>}
                         <button onClick={()=>inPlan(v.id)?remStop(v.id):addStop(v)} style={{width:"100%",background:inPlan(v.id)?"transparent":T.grad,color:inPlan(v.id)?T.red:"#fff",border:inPlan(v.id)?`1.5px solid ${T.red}`:"none",borderRadius:10,padding:"10px",fontFamily:"'DM Sans',sans-serif",fontSize:12,fontWeight:700,cursor:"pointer"}}>
                           {inPlan(v.id)?"✓ Added to Plan":"+ Add to Date Plan"}
                         </button>
@@ -1355,8 +1418,6 @@ export default function App() {
                   <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}><Star r={v.rating} T={T}/><span style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,fontWeight:700,color:T.red}}>{v.price}</span></div>
                   <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
                     <input type="time" value={v.time} onChange={e=>setTime(v.id,e.target.value)} style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:10,padding:"7px 12px",fontFamily:"'DM Sans',sans-serif",fontSize:12,color:T.text,outline:"none"}}/>
-                    
-                    {v.cat==="events"&&<button onClick={()=>openWeb(eventbriteUrl(v),`${v.name} — Tickets`)} style={{background:"#1a6b3c",color:"#fff",border:"none",borderRadius:10,padding:"7px 14px",fontFamily:"'DM Sans',sans-serif",fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>🎟️ Tickets</button>}
                   </div>
                 </div>
               </div>
