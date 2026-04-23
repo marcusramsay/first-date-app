@@ -19,15 +19,18 @@ function makeTheme(dark) {
 const PLACES_KEY = "AIzaSyCkg3ThAKCWzEu-waM_KBsX4Ys90MJNSAo";
 
 const CAT_QUERY = {
-  restaurants:"romantic dinner date night restaurant",
-  nightlife:"cocktail bar lounge rooftop bar wine bar nightclub",
-  experiences:"painting class wine tasting escape room bowling axe throwing comedy show",
-  outdoors:"parks outdoor",
-  dessert:"dessert bar cafe bakery",
+  restaurants:"restaurants",
+  nightlife:"bars nightlife",
+  experiences:"activities",
+  outdoors:"parks",
+  dessert:"dessert cafes",
 };
 const CAT_TYPE = {
-  restaurants:"restaurant", nightlife:"bar",
-  experiences:"tourist_attraction", outdoors:"park", dessert:"bakery",
+  restaurants:"restaurant",
+  nightlife:"bar",
+  experiences:"",
+  outdoors:"park",
+  dessert:"bakery",
 };
 function noiseFromTypes(types=[]) {
   if(types.includes("night_club")) return "loud";
@@ -51,7 +54,7 @@ function transformGPlace(p,cat){
   const isOpen = p.opening_hours?.open_now;
   return {
     id:p.place_id, name:p.name, cat,
-    tag:p.types?.[0]?.replace(/_/g," ").replace(/\w/g,c=>c.toUpperCase())||cat,
+    tag:cuisineType||(p.types?.find(t=>!["establishment","point_of_interest","food","premise"].includes(t))?.replace(/_/g," ").split(" ").map(w=>w.charAt(0).toUpperCase()+w.slice(1)).join(" "))||cat,
     address, mapsUrl,
     rating:p.rating||4.5, reviews:p.user_ratings_total||0,
     price:priceFromLevel(p.price_level), noise:noiseFromTypes(p.types||[]),
@@ -66,13 +69,16 @@ function transformGPlace(p,cat){
   };
 }
 // Excluded chain types — not date-appropriate
-const EXCLUDE_TYPES = ["meal_takeaway","meal_delivery","fast_food","grocery_or_supermarket","supermarket","gas_station","pharmacy","hospital","dentist","doctor","gym","laundry"];
+const EXCLUDE_TYPES = ["meal_takeaway","meal_delivery","fast_food","grocery_or_supermarket","supermarket","gas_station","pharmacy","hospital","dentist","doctor","gym","laundry","park","natural_feature","campground","cemetery","zoo"];
+const EXCLUDE_EXPERIENCES = ["park","natural_feature","campground","cemetery","zoo","transit_station","subway_station","bus_station"];
 
-function isDateAppropriate(place) {
+function isDateAppropriate(place, cat) {
   const types = place.types || [];
   if (EXCLUDE_TYPES.some(t => types.includes(t))) return false;
   if ((place.rating || 0) < 3.8) return false;
   if ((place.user_ratings_total || 0) < 20) return false;
+  // For experiences, filter out parks and nature areas
+  if (cat === "experiences" && EXCLUDE_EXPERIENCES.some(t => types.includes(t))) return false;
   return true;
 }
 
@@ -80,7 +86,8 @@ async function fetchPlacesByCity(city, cat) {
   const query = `${CAT_QUERY[cat]||cat} in ${city}`;
   const type  = CAT_TYPE[cat]||"establishment";
   // Use nearbysearch with fields including editorial_summary for descriptions
-  const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&type=${type}&key=${PLACES_KEY}`;
+  const typeParam = type ? `&type=${type}` : "";
+  const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}${typeParam}&key=${PLACES_KEY}`;
   const proxies = [
     { url:`https://corsproxy.io/?${encodeURIComponent(url)}`, parse:r=>r },
     { url:`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`, parse:r=>JSON.parse(r.contents) },
@@ -91,7 +98,7 @@ async function fetchPlacesByCity(city, cat) {
       if (!res.ok) continue;
       const raw = await res.json();
       const parsed = proxy.parse(raw);
-      const results = (parsed.results||[]).filter(isDateAppropriate);
+      const results = (parsed.results||[]).filter(p=>isDateAppropriate(p,cat));
       if (results.length > 0) return results.slice(0, 12);
     } catch { continue; }
   }
