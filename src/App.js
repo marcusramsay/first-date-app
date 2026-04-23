@@ -19,8 +19,11 @@ function makeTheme(dark) {
 const PLACES_KEY = "AIzaSyCkg3ThAKCWzEu-waM_KBsX4Ys90MJNSAo";
 
 const CAT_QUERY = {
-  restaurants:"restaurants", nightlife:"bars nightlife",
-  experiences:"activities things to do outdoors parks", outdoors:"parks outdoor", dessert:"dessert cafe",
+  restaurants:"romantic dinner date night restaurant",
+  nightlife:"cocktail bar lounge rooftop bar wine bar nightclub",
+  experiences:"painting class wine tasting escape room bowling axe throwing comedy show",
+  outdoors:"parks outdoor",
+  dessert:"dessert bar cafe bakery",
 };
 const CAT_TYPE = {
   restaurants:"restaurant", nightlife:"bar",
@@ -68,8 +71,8 @@ const EXCLUDE_TYPES = ["meal_takeaway","meal_delivery","fast_food","grocery_or_s
 function isDateAppropriate(place) {
   const types = place.types || [];
   if (EXCLUDE_TYPES.some(t => types.includes(t))) return false;
-  if ((place.rating || 0) < 4.0) return false;
-  if ((place.user_ratings_total || 0) < 50) return false;
+  if ((place.rating || 0) < 3.8) return false;
+  if ((place.user_ratings_total || 0) < 20) return false;
   return true;
 }
 
@@ -169,9 +172,9 @@ const ONBOARDING_STEPS = [
     ]},
 ];
 const noiseInfo = {
-  quiet:    { label:"Quiet",    color:"#2D9E6A", bg:"rgba(45,158,106,0.12)",  icon:"🤫" },
-  moderate: { label:"Moderate", color:"#C09020", bg:"rgba(192,144,32,0.12)",  icon:"🎵" },
-  loud:     { label:"Lively",   color:"#C03030", bg:"rgba(192,48,48,0.12)",   icon:"🔊" },
+  quiet:    { label:"Intimate",  color:"#2D9E6A", bg:"rgba(45,158,106,0.15)",  icon:"🕯️" },
+  moderate: { label:"Buzzy",     color:"#B8860B", bg:"rgba(184,134,11,0.15)",  icon:"🎶" },
+  loud:     { label:"Energetic", color:"#C03030", bg:"rgba(192,48,48,0.15)",   icon:"🎉" },
 };
 
 /* ── TINY HELPERS ────────────────────────────────────────── */
@@ -623,7 +626,7 @@ function CitySearch({ initialCity, onCommit, compact }) {
             onBlur={() => setTimeout(() => setShowSugg(false), 200)}
             onFocus={() => sugg.length > 0 && setShowSugg(true)}
             placeholder="Search city, e.g. Atlanta, GA"
-            style={{ width:"100%", background:"rgba(255,255,255,0.07)", border:"1.5px solid rgba(128,14,19,0.35)", borderRadius:22, padding:"11px 12px 11px 34px", fontFamily:"'DM Sans',sans-serif", fontSize:13, color:"inherit", outline:"none", colorScheme:"dark light" }}
+            style={{ width:"100%", background:"rgba(255,255,255,0.07)", border:"1.5px solid rgba(128,14,19,0.35)", borderRadius:22, padding:"11px 12px 11px 34px", fontFamily:"'DM Sans',sans-serif", fontSize:13, color:"#F5ECD8", outline:"none", colorScheme:"dark" }}
           />
         </div>
         <button onClick={handleNearMe} disabled={locLoading} title="Use my location"
@@ -922,12 +925,31 @@ export default function App() {
     const key = `${cityVal}|${effectiveCat}`;
     if (placesCache[key]) { setRealSpots(placesCache[key]); return; }
     setPlacesLoading(true);
-    let transformed = [];
     const raw = await fetchPlacesByCity(cityVal, effectiveCat);
-    transformed = raw.map(p => transformGPlace(p, effectiveCat));
+    const transformed = raw.map(p => transformGPlace(p, effectiveCat));
     setPlacesCache(prev => ({...prev, [key]: transformed}));
     setRealSpots(transformed);
     setPlacesLoading(false);
+    // Fetch Place Details in background for first 6 spots — gets descriptions + extra photos
+    transformed.slice(0, 6).forEach(spot => {
+      if (!spot.id) return;
+      fetchPlaceDetails(spot.id).then(d => {
+        if (!d) return;
+        const desc = d.editorial_summary?.overview || "";
+        const photos = d.photos
+          ? d.photos.slice(0,8).map(ph=>`https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photoreference=${ph.photo_reference}&key=${PLACES_KEY}`)
+          : null;
+        const hoursText = d.opening_hours?.weekday_text || null;
+        const isOpen = d.opening_hours?.open_now;
+        const enriched = {desc, photos, hoursText, isOpen};
+        setEnrichedDetails(prev => ({...prev, [spot.id]: d}));
+        if (desc || photos) {
+          const merge = s => s.id === spot.id ? {...s, ...(desc&&{desc}), ...(photos&&{photos}), ...(hoursText&&{hoursText}), ...(isOpen!==undefined&&{isOpen})} : s;
+          setPlacesCache(prev => ({...prev, [key]: (prev[key]||[]).map(merge)}));
+          setRealSpots(prev => prev.map(merge));
+        }
+      }).catch(()=>{});
+    });
   };
 
   // Preload all categories in background after city is set
